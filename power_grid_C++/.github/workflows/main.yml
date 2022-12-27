@@ -1,0 +1,192 @@
+# SPDX-FileCopyrightText: 2022 Contributors to the Power Grid Model project <dynamic.grid.calculation@alliander.com>
+#
+# SPDX-License-Identifier: MPL-2.0
+
+
+# This is a basic workflow to help you get started with Actions
+
+name: Build and Test C++ and Python
+
+# Controls when the workflow will run
+on:
+  # run pipeline on push event of main or release branch
+  push:
+    branches:
+      - main
+      - 'release/**'
+  # run pipeline on pull request
+  pull_request:
+  # Allows you to run this workflow manually from the Actions tab
+  workflow_dispatch:
+
+jobs:
+
+  build-cpp-test-linux:
+    if: (github.event_name == 'push')  || (github.event_name == 'workflow_dispatch') || (!startsWith(github.head_ref, 'release'))
+    runs-on: ubuntu-22.04
+    strategy:
+      matrix:
+        build-option: [ Debug, Release ]
+        cpp-compiler: [g++-11, clang++-14]
+    env:
+      CMAKE_PREFIX_PATH: /home/linuxbrew/.linuxbrew
+      CXX: ${{ matrix.cpp-compiler }}
+
+    steps:
+      - uses: actions/checkout@v3
+      - name: Install packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build
+      - name: Enable brew
+        run: |
+          echo "/home/linuxbrew/.linuxbrew/bin:/home/linuxbrew/.linuxbrew/sbin" >> $GITHUB_PATH
+      - name: Install C++ dependencies
+        run: |
+          brew install boost eigen nlohmann-json doctest
+      - name: Run build script
+        run: ./build.sh  ${{ matrix.build-option }}
+
+  build-cpp-test-windows:
+    if: (github.event_name == 'push')  || (github.event_name == 'workflow_dispatch') || (!startsWith(github.head_ref, 'release'))
+    runs-on: windows-latest
+    strategy:
+      matrix:
+        build-option: [ Debug, Release ]
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Activate conda
+        run: |
+          & "$env:CONDA\condabin\conda" init
+
+      - name: Install conda environment
+        run: |
+          conda create --yes -p C:\conda_envs\cpp_pkgs -c conda-forge boost-cpp eigen nlohmann_json doctest
+
+      - name: Build and test
+        run: |
+          $vsPath = &(Join-Path ${env:ProgramFiles(x86)} '\Microsoft Visual Studio\Installer\vswhere.exe') -property installationpath
+          Import-Module (Join-Path $vsPath 'Common7\Tools\Microsoft.VisualStudio.DevShell.dll')
+          Enter-VsDevShell -VsInstallPath $vsPath -SkipAutomaticLocation -DevCmdArguments '-arch=x64 -host_arch=x64'
+          mkdir cpp_build_${{ matrix.build-option }}
+          cd cpp_build_${{ matrix.build-option }}
+          # generate cmake cache
+          cmake .. `
+            -G "Ninja" `
+            -DCMAKE_BUILD_TYPE=${{ matrix.build-option }} `
+            -DCMAKE_PREFIX_PATH=C:\conda_envs\cpp_pkgs\Library
+          # build
+          cmake --build . --verbose -j 1
+          # test
+          .\tests\cpp_unit_tests\power_grid_model_unit_tests.exe
+
+  build-cpp-test-macos:
+    if: (github.event_name == 'push')  || (github.event_name == 'workflow_dispatch') || (!startsWith(github.head_ref, 'release'))
+    runs-on: macos-latest
+    strategy:
+      matrix:
+        build-option: [ Debug, Release ]
+    env:
+      CC: clang
+      CXX: clang++
+      CMAKE_PREFIX_PATH: /usr/local
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Install cpp dependencies
+        run: |
+          brew install ninja boost eigen nlohmann-json doctest
+
+      - name: Build and test
+        run: |
+          ./build.sh  ${{ matrix.build-option }} 
+
+  build-and-test-python:
+    strategy:
+      matrix:
+        platform: [ linux, macos, windows ]
+        include:
+          - platform: linux
+            os: ubuntu-latest
+          - platform: macos
+            os: macos-latest
+          - platform: windows
+            os: windows-latest
+
+    runs-on: ${{ matrix.os }}
+    needs: [build-cpp-test-linux, build-cpp-test-windows, build-cpp-test-macos]
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Set up QEMU
+        if: matrix.platform == 'linux'
+        uses: docker/setup-qemu-action@v2
+
+      - name: Build wheels
+        uses: pypa/cibuildwheel@v2.11.3
+        # GitHub Actions specific build parameters
+        env:
+          # pass GitHub runner info into Linux container
+          CIBW_ENVIRONMENT_PASS_LINUX: GITHUB_SHA GITHUB_REF GITHUB_RUN_NUMBER
+
+      - name: Keep wheel files
+        uses: actions/upload-artifact@v3
+        with:
+          name: wheelhouse
+          path: ./wheelhouse/*.whl
+
+  publish-wheels:
+    needs: build-and-test-python
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      TWINE_USERNAME: ${{ secrets.PYPI_USER }}
+      TWINE_PASSWORD: ${{ secrets.PYPI_PASS }}
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Setup python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+          architecture: x64
+
+      - uses: actions/download-artifact@v3
+        with:
+          name: wheelhouse
+          path: wheelhouse
+
+      - name: List assets
+        run: |
+          ls ./wheelhouse/*.whl -al
+
+      - name: Get tag
+        id: tag
+        run: echo "::set-output name=tag::v$(ls ./wheelhouse/*cp310*manylinux2014_x86_64*.whl | awk -F'[-]' '{print $2}')"
+
+      - name: Display tag
+        run: echo "${{ steps.tag.outputs.tag }}"
+
+      - name: Upload wheels
+        if: (github.event_name == 'push') || (github.event_name == 'workflow_dispatch')
+        run: |
+          pip install twine
+          echo "Publish to PyPI..."
+          twine upload --verbose wheelhouse/*
+
+      - name: Release
+        uses: softprops/action-gh-release@v1
+        if: (github.event_name == 'push') || (github.event_name == 'workflow_dispatch')
+        with:
+          files: |
+            ./wheelhouse/*.whl
+          tag_name: ${{ steps.tag.outputs.tag }}
+          prerelease: ${{ contains(steps.tag.outputs.tag, 'rc') }}
+          generate_release_notes: true
+          target_commitish: ${{ github.sha }}
